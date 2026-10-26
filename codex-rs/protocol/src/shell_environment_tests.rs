@@ -10,6 +10,154 @@ const TEST_NAME: &str =
     "shell_environment::tests::command_scrubber_removes_names_from_real_child_environment";
 
 #[test]
+fn default_excludes_preserve_git_config_override_tuple() {
+    let vars = [
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            "/tmp/codex-hooks".to_string(),
+        ),
+        ("API_KEY".to_string(), "filtered-key".to_string()),
+        ("CLIENT_SECRET".to_string(), "filtered-secret".to_string()),
+        ("ACCESS_TOKEN".to_string(), "filtered-token".to_string()),
+        ("SAFE".to_string(), "preserved".to_string()),
+    ];
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        populate_env(vars, &policy, /*thread_id*/ None),
+        HashMap::from([
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string(),),
+            (
+                "GIT_CONFIG_VALUE_0".to_string(),
+                "/tmp/codex-hooks".to_string(),
+            ),
+            ("SAFE".to_string(), "preserved".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn default_excludes_only_exempt_strict_git_config_key_names() {
+    let vars = [
+        ("GIT_CONFIG_KEY_0".to_string(), "preserved-zero".to_string()),
+        (
+            "GIT_CONFIG_KEY_123".to_string(),
+            "preserved-many".to_string(),
+        ),
+        ("GIT_CONFIG_KEY_".to_string(), "filtered-empty".to_string()),
+        (
+            "GIT_CONFIG_KEY_-1".to_string(),
+            "filtered-negative".to_string(),
+        ),
+        (
+            "GIT_CONFIG_KEY_1A".to_string(),
+            "filtered-suffix".to_string(),
+        ),
+        (
+            "GIT_CONFIG_KEY_0_EXTRA".to_string(),
+            "filtered-extra".to_string(),
+        ),
+        (
+            "GIT_CONFIG_KEY_１２".to_string(),
+            "filtered-unicode-digits".to_string(),
+        ),
+        (
+            "PREFIX_GIT_CONFIG_KEY_0".to_string(),
+            "filtered-prefix".to_string(),
+        ),
+        ("MONKEY".to_string(), "filtered-generic".to_string()),
+    ];
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        populate_env(vars, &policy, /*thread_id*/ None),
+        HashMap::from([
+            ("GIT_CONFIG_KEY_0".to_string(), "preserved-zero".to_string()),
+            (
+                "GIT_CONFIG_KEY_123".to_string(),
+                "preserved-many".to_string(),
+            ),
+        ])
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn git_config_key_exception_uses_unix_case_sensitive_env_semantics() {
+    let vars = [("git_config_key_0".to_string(), "filtered".to_string())];
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        populate_env(vars, &policy, /*thread_id*/ None),
+        HashMap::new()
+    );
+}
+
+#[test]
+fn git_config_key_exception_only_applies_to_default_excludes() {
+    let vars = [
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "filtered-custom".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            "filtered-by-include-only".to_string(),
+        ),
+        ("SAFE".to_string(), "preserved".to_string()),
+    ];
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        exclude: vec![EnvironmentVariablePattern::new("GIT_CONFIG_KEY_0")],
+        include_only: vec![EnvironmentVariablePattern::new("SAFE")],
+        ..Default::default()
+    };
+
+    assert_eq!(
+        populate_env(vars, &policy, /*thread_id*/ None),
+        HashMap::from([("SAFE".to_string(), "preserved".to_string())])
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn git_config_key_exception_uses_windows_case_insensitive_env_semantics() {
+    let vars = [
+        ("Git_Config_Key_0".to_string(), "preserved".to_string()),
+        (
+            "Git_Config_Key_Not_An_Index".to_string(),
+            "filtered".to_string(),
+        ),
+    ];
+    let policy = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: false,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        populate_env(vars, &policy, /*thread_id*/ None),
+        HashMap::from([("Git_Config_Key_0".to_string(), "preserved".to_string())])
+    );
+}
+
+#[test]
 fn tool_call_id_replaces_platform_equivalent_names() {
     let representable = format!("exec-雪-{}", "x".repeat(512));
     for (call_id, expected_call) in [

@@ -102,6 +102,25 @@ where
     env_map
 }
 
+// `GIT_CONFIG_KEY_<n>` is one member of Git's indexed config override tuple.
+// Keep this exception narrow so arbitrary names containing `KEY` stay scrubbed.
+fn is_git_config_key_env_var(name: &str) -> bool {
+    const PREFIX: &[u8] = b"GIT_CONFIG_KEY_";
+
+    let name = name.as_bytes();
+    if name.len() <= PREFIX.len() {
+        return false;
+    }
+
+    let (prefix, index) = name.split_at(PREFIX.len());
+    #[cfg(windows)]
+    let prefix_matches = prefix.eq_ignore_ascii_case(PREFIX);
+    #[cfg(not(windows))]
+    let prefix_matches = prefix == PREFIX;
+
+    prefix_matches && index.iter().all(u8::is_ascii_digit)
+}
+
 pub fn populate_env<I>(
     vars: I,
     policy: &ShellEnvironmentPolicy,
@@ -142,7 +161,7 @@ where
             EnvironmentVariablePattern::new_case_insensitive("*SECRET*"),
             EnvironmentVariablePattern::new_case_insensitive("*TOKEN*"),
         ];
-        env_map.retain(|k, _| !matches_any(k, &default_excludes));
+        env_map.retain(|k, _| is_git_config_key_env_var(k) || !matches_any(k, &default_excludes));
     }
 
     // Step 3 - Apply custom excludes.
