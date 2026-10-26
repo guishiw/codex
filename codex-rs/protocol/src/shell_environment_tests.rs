@@ -9,6 +9,385 @@ const CHILD_MODE_ENV_VAR: &str = "CODEX_SHELL_ENVIRONMENT_SCRUBBER_TEST_MODE";
 const TEST_NAME: &str =
     "shell_environment::tests::command_scrubber_removes_names_from_real_child_environment";
 
+fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+fn inherit_all_policy() -> ShellEnvironmentPolicy {
+    ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::All,
+        ignore_default_excludes: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn incomplete_git_config_tuple_is_removed_after_default_excludes() {
+    let policy = ShellEnvironmentPolicy {
+        ignore_default_excludes: false,
+        ..inherit_all_policy()
+    };
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+            ("SAFE", "kept"),
+        ]),
+        &policy,
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([("SAFE".to_string(), "kept".to_string())])
+    );
+}
+
+#[test]
+fn complete_git_config_tuple_is_preserved() {
+    let input = vars(&[
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+        ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+        ("GIT_CONFIG_KEY_1", "user.name"),
+        // An empty value is still a present, valid member of the tuple.
+        ("GIT_CONFIG_VALUE_1", ""),
+        ("SAFE", "kept"),
+    ]);
+
+    assert_eq!(
+        populate_env(
+            input.clone(),
+            &inherit_all_policy(),
+            /*thread_id*/ None
+        ),
+        input.into_iter().collect()
+    );
+}
+
+#[test]
+fn zero_git_config_count_is_preserved() {
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_KEY_0", "ignored.by.git"),
+            ("GIT_CONFIG_VALUE_0", "also-ignored"),
+            ("SAFE", "kept"),
+        ]),
+        &inherit_all_policy(),
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([
+            ("GIT_CONFIG_COUNT".to_string(), "0".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "ignored.by.git".to_string(),),
+            ("GIT_CONFIG_VALUE_0".to_string(), "also-ignored".to_string(),),
+            ("SAFE".to_string(), "kept".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn zero_git_config_count_remains_valid_after_default_excludes() {
+    let policy = ShellEnvironmentPolicy {
+        ignore_default_excludes: false,
+        ..inherit_all_policy()
+    };
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_CONFIG_KEY_0", "ignored.by.git"),
+            ("GIT_CONFIG_VALUE_0", "also-ignored"),
+            ("SAFE", "kept"),
+        ]),
+        &policy,
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([
+            ("GIT_CONFIG_COUNT".to_string(), "0".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "also-ignored".to_string()),
+            ("SAFE".to_string(), "kept".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn git_compatible_config_count_spellings_are_accepted() {
+    for count in [
+        "", "0", "00", "+0", "-0", "-00", "  -0", "1", "+1", "01", "\t 1",
+    ] {
+        let input = vars(&[
+            ("GIT_CONFIG_COUNT", count),
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Codex"),
+            ("SAFE", "kept"),
+        ]);
+        assert_eq!(
+            populate_env(
+                input.clone(),
+                &inherit_all_policy(),
+                /*thread_id*/ None,
+            ),
+            input.into_iter().collect(),
+            "count: {count:?}"
+        );
+    }
+}
+
+#[test]
+fn complete_tuple_ignores_and_preserves_indices_beyond_count() {
+    let input = vars(&[
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "user.name"),
+        ("GIT_CONFIG_VALUE_0", "Codex"),
+        ("GIT_CONFIG_KEY_9", "ignored.by.git"),
+        ("GIT_CONFIG_VALUE_9", "also-ignored"),
+    ]);
+
+    assert_eq!(
+        populate_env(
+            input.clone(),
+            &inherit_all_policy(),
+            /*thread_id*/ None,
+        ),
+        input.into_iter().collect()
+    );
+}
+
+#[test]
+fn sparse_or_incomplete_declared_git_config_entries_remove_the_family() {
+    for remaining in [
+        vars(&[
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Codex"),
+            ("GIT_CONFIG_VALUE_1", "codex@example.com"),
+        ]),
+        vars(&[
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Codex"),
+            ("GIT_CONFIG_KEY_1", "user.email"),
+        ]),
+    ] {
+        let result = populate_env(
+            std::iter::once(("GIT_CONFIG_COUNT".to_string(), "2".to_string()))
+                .chain(remaining)
+                .chain(std::iter::once(("SAFE".to_string(), "kept".to_string()))),
+            &inherit_all_policy(),
+            /*thread_id*/ None,
+        );
+
+        assert_eq!(
+            result,
+            HashMap::from([("SAFE".to_string(), "kept".to_string())])
+        );
+    }
+}
+
+#[test]
+fn invalid_git_config_count_removes_the_indexed_family() {
+    for count in [
+        " ",
+        "+",
+        "-1",
+        "1 ",
+        "1x",
+        "not-a-number",
+        "2147483648",
+        "184467440737095516160",
+    ] {
+        let result = populate_env(
+            vars(&[
+                ("GIT_CONFIG_COUNT", count),
+                ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+                ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+                ("GIT_CONFIG_KEY_backup", "similar-but-not-indexed"),
+                ("GIT_CONFIG_VALUE_", "similar-but-not-indexed"),
+                ("SAFE", "kept"),
+            ]),
+            &inherit_all_policy(),
+            /*thread_id*/ None,
+        );
+
+        assert_eq!(
+            result,
+            HashMap::from([
+                (
+                    "GIT_CONFIG_KEY_backup".to_string(),
+                    "similar-but-not-indexed".to_string(),
+                ),
+                (
+                    "GIT_CONFIG_VALUE_".to_string(),
+                    "similar-but-not-indexed".to_string(),
+                ),
+                ("SAFE".to_string(), "kept".to_string()),
+            ]),
+            "count: {count:?}"
+        );
+    }
+}
+
+#[test]
+fn indexed_git_config_vars_without_count_are_unchanged() {
+    let input = vars(&[
+        ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+        ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+        ("SAFE", "kept"),
+    ]);
+
+    assert_eq!(
+        populate_env(
+            input.clone(),
+            &inherit_all_policy(),
+            /*thread_id*/ None,
+        ),
+        input.into_iter().collect()
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn git_config_tuple_names_are_case_sensitive_off_windows() {
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("git_config_key_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Codex"),
+            ("SAFE", "kept"),
+        ]),
+        &inherit_all_policy(),
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([
+            ("git_config_key_0".to_string(), "user.name".to_string()),
+            ("SAFE".to_string(), "kept".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn custom_excludes_cannot_leave_an_incomplete_git_config_tuple() {
+    let policy = ShellEnvironmentPolicy {
+        exclude: vec![EnvironmentVariablePattern::new_case_insensitive(
+            "GIT_CONFIG_VALUE_1",
+        )],
+        ..inherit_all_policy()
+    };
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "user.name"),
+            ("GIT_CONFIG_VALUE_0", "Codex"),
+            ("GIT_CONFIG_KEY_1", "user.email"),
+            ("GIT_CONFIG_VALUE_1", "codex@example.com"),
+            ("SAFE", "kept"),
+        ]),
+        &policy,
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([("SAFE".to_string(), "kept".to_string())])
+    );
+}
+
+#[test]
+fn policy_set_can_restore_a_complete_git_config_tuple() {
+    let policy = ShellEnvironmentPolicy {
+        ignore_default_excludes: false,
+        r#set: HashMap::from([("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string())]),
+        ..inherit_all_policy()
+    };
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "filtered-before-set"),
+            ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+        ]),
+        &policy,
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(
+        result,
+        HashMap::from([
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string(),),
+            (
+                "GIT_CONFIG_VALUE_0".to_string(),
+                "/tmp/codex-hooks".to_string(),
+            ),
+        ])
+    );
+}
+
+#[test]
+fn include_only_cannot_leave_an_incomplete_git_config_tuple() {
+    let policy = ShellEnvironmentPolicy {
+        include_only: vec![
+            EnvironmentVariablePattern::new_case_insensitive("GIT_CONFIG_COUNT"),
+            EnvironmentVariablePattern::new_case_insensitive("GIT_CONFIG_VALUE_0"),
+        ],
+        ..inherit_all_policy()
+    };
+    let result = populate_env(
+        vars(&[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/tmp/codex-hooks"),
+            ("SAFE", "filtered"),
+        ]),
+        &policy,
+        /*thread_id*/ None,
+    );
+
+    assert_eq!(result, HashMap::new());
+}
+
+#[cfg(windows)]
+#[test]
+fn git_config_tuple_names_are_case_insensitive_on_windows() {
+    let complete = vars(&[
+        ("Git_Config_Count", "1"),
+        ("git_config_key_0", "user.name"),
+        ("GIT_CONFIG_VALUE_0", "Codex"),
+    ]);
+    assert_eq!(
+        populate_env(
+            complete.clone(),
+            &inherit_all_policy(),
+            /*thread_id*/ None,
+        ),
+        complete.into_iter().collect()
+    );
+
+    let incomplete = populate_env(
+        vars(&[
+            ("Git_Config_Count", "1"),
+            ("gIt_CoNfIg_VaLuE_0", "Codex"),
+            ("SAFE", "kept"),
+        ]),
+        &inherit_all_policy(),
+        /*thread_id*/ None,
+    );
+    assert_eq!(
+        incomplete,
+        HashMap::from([("SAFE".to_string(), "kept".to_string())])
+    );
+}
+
 #[test]
 fn tool_call_id_replaces_platform_equivalent_names() {
     let representable = format!("exec-雪-{}", "x".repeat(512));

@@ -11,6 +11,11 @@ pub const OPENAI_FEDERATION_RULE_ID_ENV_VAR: &str = "OPENAI_FEDERATION_RULE_ID";
 pub const OPENAI_IDENTITY_TOKEN_FILE_ENV_VAR: &str = "OPENAI_IDENTITY_TOKEN_FILE";
 pub const OPENAI_WORKLOAD_IDENTITY_CONTEXT_ENV_VAR: &str = "OPENAI_WORKLOAD_IDENTITY_CONTEXT";
 
+const GIT_CONFIG_COUNT_ENV_VAR: &str = "GIT_CONFIG_COUNT";
+const GIT_CONFIG_KEY_ENV_VAR_PREFIX: &str = "GIT_CONFIG_KEY_";
+const GIT_CONFIG_VALUE_ENV_VAR_PREFIX: &str = "GIT_CONFIG_VALUE_";
+const GIT_CONFIG_COUNT_MAX: usize = i32::MAX as usize;
+
 /// Environment variables that model-reachable child processes must not inherit.
 pub const NON_INHERITABLE_ENV_VARS: &[&str] = &[
     CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR,
@@ -162,7 +167,14 @@ where
         env_map.retain(|k, _| matches_any(k, &policy.include_only));
     }
 
-    // Step 6 - Populate the thread ID environment variable when provided.
+    // Step 6 - Git treats GIT_CONFIG_COUNT and each indexed KEY/VALUE pair as
+    // a single unit. Any shell-environment policy stage can otherwise leave a
+    // partial tuple that makes every Git command fail, so drop an incomplete
+    // tuple conservatively after all user-configurable filtering and
+    // overrides.
+    remove_incomplete_git_config_env(&mut env_map);
+
+    // Step 7 - Populate the thread ID environment variable when provided.
     if let Some(thread_id) = thread_id {
         env_map.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
     }
@@ -172,6 +184,139 @@ where
     env_map.retain(|name, _| !is_non_inheritable_env_var(name));
 
     env_map
+}
+
+fn remove_incomplete_git_config_env(env_map: &mut HashMap<String, String>) {
+    let count_values = env_map
+        .iter()
+        .filter(|(name, _)| env_name_eq(name, GIT_CONFIG_COUNT_ENV_VAR))
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    let count = match count_values.as_slice() {
+        [] => return,
+        [count] => match parse_git_config_count(count) {
+            Ok(count) => count,
+            Err(_) => {
+                remove_git_config_env(env_map);
+                return;
+            }
+        },
+        // Multiple case-equivalent count variables on Windows do not form an
+        // unambiguous tuple.
+        _ => {
+            remove_git_config_env(env_map);
+            return;
+        }
+    };
+
+    if count == 0 {
+        return;
+    }
+
+    // Each configured entry requires both a key and a value. Reject counts
+    // that cannot possibly fit in the current environment before iterating so
+    // a hostile or corrupt count cannot cause an unbounded loop.
+    if count > env_map.len() / 2 {
+        remove_git_config_env(env_map);
+        return;
+    }
+
+    let is_complete = (0..count).all(|index| {
+        let key_name = format!("{GIT_CONFIG_KEY_ENV_VAR_PREFIX}{index}");
+        let value_name = format!("{GIT_CONFIG_VALUE_ENV_VAR_PREFIX}{index}");
+        env_contains_key(env_map, &key_name) && env_contains_key(env_map, &value_name)
+    });
+
+    if !is_complete {
+        remove_git_config_env(env_map);
+    }
+}
+
+fn remove_git_config_env(env_map: &mut HashMap<String, String>) {
+    env_map.retain(|name, _| {
+        !env_name_eq(name, GIT_CONFIG_COUNT_ENV_VAR)
+            && !is_indexed_git_config_env_var(name, GIT_CONFIG_KEY_ENV_VAR_PREFIX)
+            && !is_indexed_git_config_env_var(name, GIT_CONFIG_VALUE_ENV_VAR_PREFIX)
+    });
+}
+
+fn parse_git_config_count(value: &str) -> Result<usize, ()> {
+    // Git parses this variable with strtoul(3), then rejects values above
+    // INT_MAX. Match its accepted spellings, including an empty string (zero),
+    // leading ASCII whitespace, an optional sign, and leading zeroes. A minus
+    // sign is only valid when the parsed value is zero.
+    if value.is_empty() {
+        return Ok(0);
+    }
+
+    let bytes = value.as_bytes();
+    let mut index = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .ok_or(())?;
+    let is_negative = bytes[index] == b'-';
+    if bytes[index] == b'+' || is_negative {
+        index += 1;
+    }
+    if index == bytes.len() || !bytes[index].is_ascii_digit() {
+        return Err(());
+    }
+
+    let mut count = 0usize;
+    for byte in &bytes[index..] {
+        if !byte.is_ascii_digit() {
+            return Err(());
+        }
+        count = count
+            .checked_mul(10)
+            .and_then(|count| count.checked_add(usize::from(byte - b'0')))
+            .filter(|count| *count <= GIT_CONFIG_COUNT_MAX)
+            .ok_or(())?;
+    }
+    if is_negative && count != 0 {
+        Err(())
+    } else {
+        Ok(count)
+    }
+}
+
+fn is_indexed_git_config_env_var(name: &str, prefix: &str) -> bool {
+    env_name_strip_prefix(name, prefix).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+#[cfg(not(windows))]
+fn env_contains_key(env_map: &HashMap<String, String>, name: &str) -> bool {
+    env_map.contains_key(name)
+}
+
+#[cfg(windows)]
+fn env_contains_key(env_map: &HashMap<String, String>, name: &str) -> bool {
+    env_map.keys().any(|candidate| env_name_eq(candidate, name))
+}
+
+#[cfg(not(windows))]
+fn env_name_eq(name: &str, expected: &str) -> bool {
+    name == expected
+}
+
+#[cfg(windows)]
+fn env_name_eq(name: &str, expected: &str) -> bool {
+    name.eq_ignore_ascii_case(expected)
+}
+
+#[cfg(not(windows))]
+fn env_name_strip_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+}
+
+#[cfg(windows)]
+fn env_name_strip_prefix<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = name.as_bytes().get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix.as_bytes())
+        .then(|| &name[prefix.len()..])
 }
 
 #[cfg(not(target_os = "windows"))]
